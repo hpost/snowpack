@@ -1,17 +1,100 @@
 import type CSSModuleLoader from 'css-modules-loader-core';
-import type {EventEmitter} from 'events';
-import execa from 'execa';
-import npmRunPath from 'npm-run-path';
-import {
-  BuildScript,
-  SnowpackConfig,
-  SnowpackPluginBuildArgs,
-  SnowpackPluginBuildResult,
-} from '../config';
+import {EventEmitter} from 'events';
+import path from 'path';
+import {SnowpackBuildMap, SnowpackConfig, SnowpackPlugin, SnowpackSourceFile} from '../config';
+import {getExt, replaceExt} from '../util';
+
+export interface BuildFileOptions {
+  buildPipeline: Record<string, SnowpackPlugin[]>;
+  messageBus: EventEmitter;
+}
 
 const IS_PREACT = /from\s+['"]preact['"]/;
 export function checkIsPreact(filePath: string, contents: string) {
   return filePath.endsWith('.jsx') && IS_PREACT.test(contents);
+}
+
+export function getInputsFromOutput(fileLoc: string, plugins: SnowpackPlugin[]) {
+  const ext = path.extname(fileLoc);
+  const potentialInputs = new Set([fileLoc]);
+  for (const plugin of plugins) {
+    if (plugin.output.includes(ext)) {
+      plugin.input.forEach((inp) => potentialInputs.add(fileLoc.replace(ext, inp)));
+    }
+  }
+  return Array.from(potentialInputs);
+}
+
+/** Core Snowpack file pipeline builder */
+export async function buildFile(
+  srcPath: string,
+  srcContents: string,
+  destPath: string,
+  {buildPipeline, messageBus}: BuildFileOptions,
+): Promise<SnowpackBuildMap> {
+  const srcExt = getExt(srcPath);
+  const output: SnowpackBuildMap = {}; // important: clear output for each src file to keep memory low
+  output[destPath] = {...srcExt, contents: srcContents, locOnDisk: srcPath}; // this is the object we’ll mutate through transformations
+
+  // transform with Snowpack plugins (main build pipeline)
+  for (const step of buildPipeline[srcExt.expandedExt || srcExt.baseExt] || []) {
+    if (step.build) {
+      const result = await step.build({
+        contents: output[destPath].contents,
+        filePath: srcPath,
+        urlPath: srcPath,
+        isDev: false,
+        log: (msg, data) => {
+          messageBus.emit(msg, {
+            ...data,
+            id: step.name,
+            msg: data.msg && `[${srcPath}] ${data.msg}`,
+          });
+        },
+      });
+      if (!result) {
+        continue;
+      }
+      if (typeof result === 'string') {
+        // Path A: single-output (assume extension is same)
+        output[destPath].contents = result;
+      } else if (typeof result === 'object' && !result.result) {
+        // Path B: multi-file output ({ js: [string], css: [string], … })
+        Object.entries(result as {[ext: string]: string}).forEach(([ext, contents]) => {
+          if (!contents) {
+            return;
+          }
+          const newDest = replaceExt(destPath, ext);
+          output[newDest] = {baseExt: ext, expandedExt: ext, contents, locOnDisk: srcPath};
+        });
+      } else if (typeof result === 'object' && result.result) {
+        // Path C: DEPRECATED output ({ result, resources })
+        output[destPath].contents = result.result;
+
+        // handle CSS output for Svelte/Vue
+        if (typeof result.resources === 'object' && result.resources.css) {
+          const cssFile = replaceExt(destPath, '.css');
+          output[cssFile] = {
+            baseExt: '.css',
+            expandedExt: '.css',
+            contents: result.resources.css,
+            locOnDisk: srcPath,
+          };
+        }
+      }
+
+      // filter out unused extensions (i.e. don’t emit source files to build)
+      const outputs = Array.isArray(step.output) ? step.output : [step.output];
+      Object.keys(output).forEach((key) => {
+        const {baseExt} = getExt(key);
+        if (!outputs.includes(baseExt)) {
+          delete output[key];
+        }
+      });
+    }
+  }
+
+  return output;
 }
 
 export function wrapImportMeta({
@@ -93,7 +176,7 @@ export function wrapHtmlResponse({
   buildOptions: SnowpackConfig['buildOptions'];
 }) {
   // replace %PUBLIC_URL% in HTML files (along with surrounding slashes, if any)
-  code = code.replace(/\/?%PUBLIC_URL%\/?/g, '/');
+  code = code.replace(/\/?%PUBLIC_URL%\/?/g, buildOptions.baseUrl);
 
   if (hasHmr) {
     code += `<script type="module" src="/${buildOptions.metaDir}/hmr.js"></script>`;
@@ -154,53 +237,6 @@ document.head.appendChild(styleEl);`;
   return `export default ${JSON.stringify(url)};`;
 }
 
-export type FileBuilder = (
-  args: SnowpackPluginBuildArgs,
-) => null | SnowpackPluginBuildResult | Promise<null | SnowpackPluginBuildResult>;
-export function getFileBuilderForWorker(
-  cwd: string,
-  selectedWorker: BuildScript,
-  messageBus: EventEmitter,
-): FileBuilder | undefined {
-  const {id, type, cmd, plugin} = selectedWorker;
-  if (type !== 'build') {
-    throw new Error(`scripts[${id}] is not a build script.`);
-  }
-  if (plugin?.build) {
-    const buildFn = plugin.build;
-    return async (args: SnowpackPluginBuildArgs) => {
-      try {
-        const result = await buildFn(args);
-        return result;
-      } catch (err) {
-        messageBus.emit('WORKER_MSG', {id, level: 'error', msg: err.message});
-        messageBus.emit('WORKER_UPDATE', {id, state: ['ERROR', 'red']});
-        return null;
-      }
-    };
-  }
-  return async ({contents, filePath}: SnowpackPluginBuildArgs) => {
-    let cmdWithFile = cmd.replace('$FILE', filePath);
-    try {
-      const {stdout, stderr} = await execa.command(cmdWithFile, {
-        env: npmRunPath.env(),
-        extendEnv: true,
-        shell: true,
-        input: contents,
-        cwd,
-      });
-      if (stderr) {
-        messageBus.emit('WORKER_MSG', {id, level: 'warn', msg: `${filePath}\n${stderr}`});
-      }
-      return {result: stdout};
-    } catch (err) {
-      messageBus.emit('WORKER_MSG', {id, level: 'error', msg: `${filePath}\n${err.stderr}`});
-      messageBus.emit('WORKER_UPDATE', {id, state: ['ERROR', 'red']});
-      return null;
-    }
-  };
-}
-
 const PUBLIC_ENV_REGEX = /^SNOWPACK_PUBLIC_/;
 export function generateEnvModule(mode: 'development' | 'production') {
   const envObject = {...process.env};
@@ -213,3 +249,4 @@ export function generateEnvModule(mode: 'development' | 'production') {
   envObject.NODE_ENV = mode;
   return `export default ${JSON.stringify(envObject)};`;
 }
+

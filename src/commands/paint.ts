@@ -1,9 +1,9 @@
 import detectPort from 'detect-port';
 import {EventEmitter} from 'events';
 import * as colors from 'kleur/colors';
+import path from 'path';
 import readline from 'readline';
 import util from 'util';
-import {BuildScript} from '../config';
 import {isYarn} from '../util';
 const cwd = process.cwd();
 
@@ -65,11 +65,11 @@ function getStateString(workerState: any, isWatch: boolean): [colors.Colorize, s
   return [colors.dim, 'READY'];
 }
 
-const WORKER_BASE_STATE = {done: false, error: null, output: ''};
+const WORKER_BASE_STATE = {done: false, error: null, output: '', config: {}};
 
 export function paint(
   bus: EventEmitter,
-  registeredWorkers: BuildScript[],
+  scripts: string[],
   buildMode: {dest: string} | undefined,
   devMode:
     | {
@@ -87,9 +87,16 @@ export function paint(
   let hasBeenCleared = false;
   let missingWebModule: null | {id: string; spec: string; pkgName: string} = null;
   const allWorkerStates: any = {};
+  const allFileBuilds = new Set<string>();
 
-  for (const config of registeredWorkers) {
-    allWorkerStates[config.id] = {...WORKER_BASE_STATE, config};
+  for (const script of scripts) {
+    allWorkerStates[script] = {...WORKER_BASE_STATE};
+  }
+
+  function setupWorker(id: string) {
+    if (!allWorkerStates[id]) {
+      allWorkerStates[id] = {...WORKER_BASE_STATE};
+    }
   }
 
   function repaint() {
@@ -98,11 +105,12 @@ export function paint(
     // Dashboard
     if (devMode) {
       const isServerStarted = startTimeMs > 0 && port > 0 && protocol;
+
       if (isServerStarted) {
         process.stdout.write(`  ${colors.bold(colors.cyan(`${protocol}//localhost:${port}`))}`);
         for (const ip of ips) {
           process.stdout.write(
-            `${colors.cyan(` > `)}${colors.bold(colors.cyan(`${protocol}//${ip}:${port}`))}`,
+            `${colors.cyan(` • `)}${colors.bold(colors.cyan(`${protocol}//${ip}:${port}`))}`,
           );
         }
         process.stdout.write('\n');
@@ -111,6 +119,9 @@ export function paint(
             startTimeMs < 1000 ? `  Server started in ${startTimeMs}ms.` : `  Server started.`, // Not to hide slow startup times, but likely there were extraneous factors (prompts, etc.) where the speed isn’t accurate
           ),
         );
+        if (allFileBuilds.size > 0) {
+          process.stdout.write(colors.dim(` Building...`));
+        }
         process.stdout.write('\n\n');
       } else {
         process.stdout.write(colors.dim(`  Server starting…`) + '\n\n');
@@ -121,22 +132,23 @@ export function paint(
       process.stdout.write(colors.dim(` Building your application...\n\n`));
     }
 
-    for (const config of registeredWorkers) {
-      if (devMode && config.type === 'bundle') {
+    let didPrintDashboard = false;
+    for (const script of Object.keys(allWorkerStates)) {
+      const workerState = allWorkerStates[script];
+      if (!workerState.state) {
         continue;
       }
-      const workerState = allWorkerStates[config.id];
-      const dotLength = 24 - config.id.length;
+      const dotLength = 34 - script.length;
       const dots = colors.dim(''.padEnd(dotLength, '.'));
       const [fmt, stateString] = getStateString(workerState, !!devMode);
-      const spacer = ' '; //.padEnd(8 - stateString.length);
-      let cmdMsg = `${config.plugin && config.cmd[0] !== '(' ? '(plugin) ' : ''}${config.cmd}`;
-      if (cmdMsg.length > 52) {
-        cmdMsg = cmdMsg.substr(0, 52) + '...';
-      }
-      const cmdStr = stateString === 'FAIL' ? colors.red(cmdMsg) : colors.dim(cmdMsg);
-      process.stdout.write(`  ${config.id}${dots}[${fmt(stateString)}]${spacer}${cmdStr}\n`);
+      process.stdout.write(`  ${script}${dots}[${fmt(stateString)}]\n`);
+      didPrintDashboard = true;
     }
+
+    if (didPrintDashboard) {
+      process.stdout.write('\n');
+    }
+
     process.stdout.write('\n');
     if (isInstalling) {
       process.stdout.write(`${colors.underline(colors.bold('▼ snowpack install'))}\n\n`);
@@ -166,11 +178,11 @@ export function paint(
       }
       return;
     }
-    for (const config of registeredWorkers) {
-      const workerState = allWorkerStates[config.id];
+    for (const script of Object.keys(allWorkerStates)) {
+      const workerState = allWorkerStates[script];
       if (workerState && workerState.output) {
         const colorsFn = Array.isArray(workerState.error) ? colors.red : colors.reset;
-        process.stdout.write(`${colorsFn(colors.underline(colors.bold('▼ ' + config.id)))}\n\n`);
+        process.stdout.write(`${colorsFn(colors.underline(colors.bold('▼ ' + script)))}\n\n`);
         process.stdout.write(
           workerState.output
             ? '  ' + workerState.output.trim().replace(/\n/gm, '\n  ')
@@ -212,18 +224,33 @@ export function paint(
     }
   }
 
+  bus.on('BUILD_FILE', ({id, isBuilding}) => {
+    if (isBuilding) {
+      allFileBuilds.add(path.relative(cwd, id));
+    } else {
+      allFileBuilds.delete(path.relative(cwd, id));
+    }
+    repaint();
+  });
+  bus.on('WORKER_START', ({id, state}) => {
+    setupWorker(id);
+    allWorkerStates[id].state = state || ['RUNNING', 'yellow'];
+    repaint();
+  });
   bus.on('WORKER_MSG', ({id, msg}) => {
+    setupWorker(id);
     allWorkerStates[id].output += msg;
     repaint();
   });
   bus.on('WORKER_UPDATE', ({id, state}) => {
     if (typeof state !== undefined) {
+      setupWorker(id);
       allWorkerStates[id].state = state;
     }
     repaint();
   });
   bus.on('WORKER_COMPLETE', ({id, error}) => {
-    allWorkerStates[id].state = null;
+    allWorkerStates[id].state = ['DONE', 'green'];
     allWorkerStates[id].done = true;
     allWorkerStates[id].error = allWorkerStates[id].error || error;
     repaint();
@@ -249,11 +276,12 @@ export function paint(
       hasBeenCleared = true;
     }
     // Reset all per-file build scripts
-    for (const config of registeredWorkers) {
-      if (config.type === 'build') {
-        allWorkerStates[config.id] = {
+    for (const script of scripts) {
+      if (script.startsWith('build')) {
+        setupWorker(script);
+        allWorkerStates[script] = {
           ...WORKER_BASE_STATE,
-          config: allWorkerStates[config.id].config,
+          config: allWorkerStates[script].config,
         };
       }
     }
