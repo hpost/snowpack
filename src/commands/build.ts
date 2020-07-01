@@ -357,7 +357,7 @@ export async function command(commandOptions: CommandOptions) {
               : path.resolve(path.dirname(outLoc), spec),
           );
         }
-        return resolvedImportUrl;
+        return path.posix.normalize(resolvedImportUrl);
       }
       return spec;
     });
